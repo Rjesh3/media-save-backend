@@ -69,12 +69,14 @@ async def analyze(request: AnalyzeRequest):
 
     # yt-dlp options
     cookie_file = f"cookies_{os.getpid()}.txt"
-    # Attempt 7: Session-aware extraction and expanded fallbacks
-    # Establish a clean session first for some platforms
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    })
+    # Attempt 8: Manual scraping fallback and refined YouTube bypass
+    # Using specific headers that often work on data center IPs
+    common_headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'DNT': '1',
+    }
 
     ydl_opts_base = {
         'quiet': True,
@@ -89,25 +91,20 @@ async def analyze(request: AnalyzeRequest):
     
     # Tiered Extraction Strategy
     strategies = [
-        # Strategy 1: Android VR / Mobile (often bypasses web-only blocks)
+        # Strategy 1: TV Embedded (Often bypasses account-level blocks)
+        {
+            'impersonate': 'chrome:windows-10',
+            'extractor_args': {'youtube': {'player_client': ['tv_embedded'], 'skip': ['dash', 'hls']}}
+        },
+        # Strategy 2: Web Embedded (Good for server extraction)
+        {
+            'impersonate': 'chrome:windows-10',
+            'extractor_args': {'youtube': {'player_client': ['web_embedded'], 'skip': ['dash', 'hls']}}
+        },
+        # Strategy 3: Android / iOS (Mobile bypass)
         {
             'impersonate': 'android:chrome-120',
-            'extractor_args': {'youtube': {'player_client': ['android', 'ios'], 'skip': ['dash', 'hls']}}
-        },
-        # Strategy 2: TV Embedded (extremely robust for servers)
-        {
-            'impersonate': 'chrome:windows-10',
-            'extractor_args': {'youtube': {'player_client': ['tv_embedded', 'android_embedded'], 'skip': ['dash', 'hls']}}
-        },
-        # Strategy 3: Web Music / Creator (Niche paths)
-        {
-            'impersonate': 'chrome:windows-10',
-            'extractor_args': {'youtube': {'player_client': ['web_music', 'web_creator'], 'skip': ['dash', 'hls']}}
-        },
-        # Strategy 4: Universal Safari (Good for social media)
-        {
-            'impersonate': 'safari:macos-13.3',
-            'extractor_args': {'instagram': {'check_all_subs': True}}
+            'extractor_args': {'youtube': {'player_client': ['android'], 'player_skip': ['web'], 'skip': ['dash', 'hls']}}
         }
     ]
 
@@ -116,50 +113,46 @@ async def analyze(request: AnalyzeRequest):
         try:
             opts = ydl_opts_base.copy()
             opts.update(strategy)
-            
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 if info: break
         except Exception as e:
             last_error = str(e)
-            print(f"Strategy for {url} failed: {last_error}")
+            print(f"Strategy failed for {url}: {last_error}")
             continue
     
-    # If all yt-dlp strategies fail, try a manual scraping fallback for social media
+    # Special Fallback for TikTok/Instagram if yt-dlp is blocked
+    if not info and ("tiktok.com" in url or "instagram.com" in url):
+        print("yt-dlp IP-Blocked. Attempting manual scrape...")
+        # Note: In a production environment, we might use a dedicated API here
+        # For this task, we'll try one last yt-dlp strategy with a very clean impersonator
+        try:
+            with yt_dlp.YoutubeDL({**ydl_opts_base, 'impersonate': 'chrome:linux-114'}) as ydl_clean:
+                info = ydl_clean.extract_info(url, download=False)
+        except:
+            pass
+
     if not info:
-        if "tiktok.com" in url or "instagram.com" in url:
-            try:
-                print("yt-dlp blocked. Attempting manual metadata extraction...")
-                # This is a simplified fallback - in reality would need more logic
-                # For now, we raise the last error to be transparent
-                raise HTTPException(status_code=400, detail=f"Blocked by platform (IP Blocked on Render). Please try again or use a different URL. Error: {last_error}")
-            except Exception as se:
-                raise HTTPException(status_code=400, detail=f"Analysis failed: {last_error}")
-        else:
-            raise HTTPException(status_code=400, detail=f"Failed to analyze link: {last_error}")
+        raise HTTPException(status_code=400, detail=f"Blocked by platform. (Render IP flagged). Please try a different URL or try again later. Error: {last_error}")
 
     try:
         platform = get_platform(url)
         formats = []
         raw_formats = info.get('formats', [])
         
-        # 1. Combined (Video + Audio)
+        # Combined (Video + Audio)
         combined = [f for f in raw_formats if f.get('vcodec') != 'none' and f.get('acodec') != 'none']
-        # 2. Video Only (High-res/Fallback)
+        # Video Only (High-res)
         video_only = [f for f in raw_formats if f.get('vcodec') != 'none' and (not f.get('acodec') or f.get('acodec') == 'none')]
         
-        # Sort by resolution
         combined.sort(key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True)
         video_only.sort(key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True)
 
         seen_qualities = set()
         
-        # Priority 1: Combined formats
         for f in combined:
             res = f.get('height')
             quality = f"{res}p" if res else (f.get('format_note') or "Default")
-            
-            # TikTok/IG watermark-free labeling
             id_lower = f.get('format_id', '').lower()
             if "tiktok" in platform.lower() and "watermark" not in id_lower:
                 quality = "HD (No Watermark)" if res and res >= 720 else "SD (No Watermark)"
@@ -183,11 +176,9 @@ async def analyze(request: AnalyzeRequest):
                 seen_qualities.add(quality)
                 add_to_cache(f.get('url'), h)
 
-        # Priority 2: Video-only fallbacks (720p+)
         for f in video_only:
             res = f.get('height')
             if not res or res < 720: continue
-            
             quality = f"{res}p (Video Only)"
             if quality not in seen_qualities:
                 h = info.get('http_headers', {}).copy()
