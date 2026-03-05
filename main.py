@@ -69,116 +69,119 @@ async def analyze(request: AnalyzeRequest):
 
     # yt-dlp options
     cookie_file = f"cookies_{os.getpid()}.txt"
-    # Advanced bypass strategy: target mobile clients specifically
-    ydl_opts = {
+    # Attempt 5: Ultra-robust extraction with specific client rotation
+    ydl_opts_base = {
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        # Use a more randomized user agent to avoid footprinting
-        'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1',
         'cookiefile': cookie_file,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['ios', 'android'],
-                'player_skip': ['web'],
-                'skip': ['dash', 'hls']
-            }
-        },
-        # Important for YouTube bypass in server environments
         'youtube_include_dash_manifest': False,
         'youtube_include_hls_manifest': False,
     }
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                # Try with mobile clients first
+    platforms_needing_fallback = ["youtube", "instagram", "facebook"]
+    info = None
+    
+    # Tiered Extraction Strategy
+    strategies = [
+        # Strategy 1: Mobile clients (often bypass data center blocks)
+        {
+            'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1',
+            'extractor_args': {'youtube': {'player_client': ['ios', 'android'], 'player_skip': ['web'], 'skip': ['dash', 'hls']}}
+        },
+        # Strategy 2: TV Embedded (Very robust for server environments)
+        {
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'extractor_args': {'youtube': {'player_client': ['tv_embedded'], 'player_skip': ['web'], 'skip': ['dash', 'hls']}}
+        },
+        # Strategy 3: Standard Web with specific referrer
+        {
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+            'referer': 'https://www.google.com/',
+            'extractor_args': {'youtube': {'player_client': ['web'], 'player_skip': ['ios', 'android']}}
+        }
+    ]
+
+    last_error = ""
+    for strategy in strategies:
+        try:
+            opts = {**ydl_opts_base, **strategy}
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-            except Exception as e:
-                error_msg = str(e)
-                print(f"Extraction failed: {error_msg}")
-                
-                # If YouTube bot detection, try with ONLY android (sometimes more robust)
-                if "Sign in to confirm you’re not a bot" in error_msg and "youtube" in url:
-                    print("Bot detection hit. Retrying with Android-only client...")
-                    ydl_opts['extractor_args']['youtube']['player_client'] = ['android']
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
-                        info = ydl2.extract_info(url, download=False)
-                elif "instagram" in url or "facebook" in url:
-                    # For social media, try with a very basic chrome user agent as fallback
-                    print("Social media extraction failed. Retrying with desktop headers...")
-                    ydl_opts['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl3:
-                        info = ydl3.extract_info(url, download=False)
-                else:
-                    raise e
-            
-            platform = get_platform(url)
-            formats = []
-            raw_formats = info.get('formats', [])
-            
-            # Identify Combined (Video + Audio)
-            combined = [f for f in raw_formats if f.get('vcodec') != 'none' and f.get('acodec') != 'none']
-            # Identify Video Only (High-res fallbacks for YouTube/etc)
-            video_only = [f for f in raw_formats if f.get('vcodec') != 'none' and f.get('acodec') == 'none']
-            
-            # Sort combined by height
-            combined.sort(key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True)
-            # Sort video_only by height
-            video_only.sort(key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True)
+                if info: break
+        except Exception as e:
+            last_error = str(e)
+            print(f"Strategy failed for {url}: {last_error}")
+            continue
+    
+    if not info:
+        raise HTTPException(status_code=400, detail=f"Failed to analyze link after multiple attempts: {last_error}")
 
-            seen_qualities = set()
+    try:
+        platform = get_platform(url)
+        formats = []
+        raw_formats = info.get('formats', [])
+        
+        # 1. Combined (Video + Audio)
+        combined = [f for f in raw_formats if f.get('vcodec') != 'none' and f.get('acodec') != 'none']
+        # 2. Video Only (High-res/Fallback)
+        video_only = [f for f in raw_formats if f.get('vcodec') != 'none' and (not f.get('acodec') or f.get('acodec') == 'none')]
+        
+        # Sort by resolution
+        combined.sort(key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True)
+        video_only.sort(key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True)
+
+        seen_qualities = set()
+        
+        # Priority 1: Combined formats
+        for f in combined:
+            res = f.get('height')
+            quality = f"{res}p" if res else (f.get('format_note') or "Default")
             
-            for f in combined:
-                res = f.get('height')
-                quality = f"{res}p" if res else (f.get('format_note') or "Default")
-                
-                if "tiktok" in platform.lower() and "watermark" not in f.get('format_id', '').lower():
-                    quality = "HD (No Watermark)" if res and res >= 720 else "SD (No Watermark)"
+            # TikTok/IG watermark-free labeling
+            id_lower = f.get('format_id', '').lower()
+            if "tiktok" in platform.lower() and "watermark" not in id_lower:
+                quality = "HD (No Watermark)" if res and res >= 720 else "SD (No Watermark)"
 
-                if res and res >= 720 and "HD" not in quality and "No Watermark" not in quality:
-                    quality += " (HD)"
-                
-                if quality not in seen_qualities:
-                    all_headers = info.get('http_headers', {}).copy()
-                    all_headers.update(f.get('http_headers', {}))
-                    
-                    formats.append({
-                        "quality": quality,
-                        "format": f.get('ext', 'mp4'),
-                        "size": format_size(f.get('filesize') or f.get('filesize_approx')),
-                        "download_url": f.get('url'),
-                        "headers": all_headers,
-                        "vcodec": f.get('vcodec'),
-                        "acodec": f.get('acodec'),
-                        "type": "video"
-                    })
-                    seen_qualities.add(quality)
-                    add_to_cache(f.get('url'), all_headers)
+            if res and res >= 720 and "HD" not in quality and "No Watermark" not in quality:
+                quality += " (HD)"
+            
+            if quality not in seen_qualities:
+                h = info.get('http_headers', {}).copy()
+                h.update(f.get('http_headers', {}))
+                formats.append({
+                    "quality": quality,
+                    "format": f.get('ext', 'mp4'),
+                    "size": format_size(f.get('filesize') or f.get('filesize_approx')),
+                    "download_url": f.get('url'),
+                    "headers": h,
+                    "vcodec": f.get('vcodec'),
+                    "acodec": f.get('acodec'),
+                    "type": "video"
+                })
+                seen_qualities.add(quality)
+                add_to_cache(f.get('url'), h)
 
-            # High-res Fallbacks (Video Only) - Only if 1080p or higher and NOT already seen as combined
-            for f in video_only:
-                res = f.get('height')
-                if not res or res < 720: continue
-                
-                quality = f"{res}p (Video Only)"
-                # If we already have a combined 1080p, we might not need this, but usually high-res is ONLY video-only
-                if quality not in seen_qualities:
-                    all_headers = info.get('http_headers', {}).copy()
-                    all_headers.update(f.get('http_headers', {}))
-                    
-                    formats.append({
-                        "quality": quality,
-                        "format": f.get('ext', 'mp4'),
-                        "size": format_size(f.get('filesize') or f.get('filesize_approx')),
-                        "download_url": f.get('url'),
-                        "headers": all_headers,
-                        "vcodec": f.get('vcodec'),
-                        "acodec": "none",
-                        "type": "video_only"
-                    })
-                    seen_qualities.add(quality)
-                    add_to_cache(f.get('url'), all_headers)
+        # Priority 2: Video-only fallbacks (720p+)
+        for f in video_only:
+            res = f.get('height')
+            if not res or res < 720: continue
+            
+            quality = f"{res}p (Video Only)"
+            if quality not in seen_qualities:
+                h = info.get('http_headers', {}).copy()
+                h.update(f.get('http_headers', {}))
+                formats.append({
+                    "quality": quality,
+                    "format": f.get('ext', 'mp4'),
+                    "size": format_size(f.get('filesize') or f.get('filesize_approx')),
+                    "download_url": f.get('url'),
+                    "headers": h,
+                    "vcodec": f.get('vcodec'),
+                    "type": "video_only"
+                })
+                seen_qualities.add(quality)
+                add_to_cache(f.get('url'), h)
 
             # Add an MP3 option if possible - support multiple audio bitrates
             audio_formats = [f for f in raw_formats if f.get('vcodec') == 'none' and f.get('acodec') != 'none']
