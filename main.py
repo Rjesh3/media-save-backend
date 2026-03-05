@@ -72,7 +72,7 @@ async def analyze(request: AnalyzeRequest):
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
-        # Prefer combined formats for direct streaming without backend merging
+        # Strictly prefer combined formats for direct streaming
         'format': 'best[ext=mp4]/best',
         'skip_download': True,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -82,23 +82,17 @@ async def analyze(request: AnalyzeRequest):
         'nocheckcertificate': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['ios', 'web'],
-                'player_skip': ['configs', 'web_embedded_client']
+                'player_client': ['android', 'ios', 'web'],
+                'player_skip': ['web_embedded_client'],
+                'skip': ['dash', 'hls'] # For extraction, we mostly want direct links for proxying
             }
         }
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Special handling for YouTube bot detection: try multiple times or with different settings
-            try:
-                info = ydl.extract_info(url, download=False)
-            except Exception as e:
-                if "Sign in to confirm you’re not a bot" in str(e):
-                    # Fallback or retry logic if needed
-                    print(f"Bot detection hit for {url}, attempting alternative extraction...")
-                    raise e
-                raise e
+            # YouTube bot detection bypass: try fetching with multiple retries if needed
+            info = ydl.extract_info(url, download=False)
             
             platform = get_platform(url)
             formats = []
@@ -106,21 +100,21 @@ async def analyze(request: AnalyzeRequest):
             # Extract relevant formats
             raw_formats = info.get('formats', [])
             
-            # Sort by height descending
-            raw_formats.sort(key=lambda x: (x.get('vcodec') != 'none', x.get('height') or 0, x.get('tbr') or 0), reverse=True)
+            # Sort by height descending, prioritizing those that HAVE both video and audio
+            raw_formats.sort(key=lambda x: (
+                (x.get('vcodec') != 'none' and x.get('acodec') != 'none'), 
+                x.get('height') or 0, 
+                x.get('tbr') or 0
+            ), reverse=True)
 
             seen_qualities = set()
             
             for f in raw_formats:
-                # MUST have both video and audio for direct streaming
                 vcodec = f.get('vcodec')
                 acodec = f.get('acodec')
                 
-                is_video = vcodec and vcodec != 'none'
-                is_audio = acodec and acodec != 'none'
-                
-                # Check for combined formats (has both)
-                if is_video and is_audio:
+                # MUST have both video and audio for direct streaming proxy
+                if vcodec and vcodec != 'none' and acodec and acodec != 'none':
                     res = f.get('height')
                     if res:
                         quality = f"{res}p"
@@ -140,7 +134,6 @@ async def analyze(request: AnalyzeRequest):
                         quality += " (SD)"
 
                     ext = f.get('ext', 'mp4')
-                    # Merge global headers with format headers
                     all_headers = info.get('http_headers', {}).copy()
                     all_headers.update(f.get('http_headers', {}))
                     
@@ -159,7 +152,6 @@ async def analyze(request: AnalyzeRequest):
                             "acodec": acodec
                         })
                         seen_qualities.add(quality)
-                        # Store in cache for backend retrieval during download
                         add_to_cache(download_url, all_headers)
 
             # Add an MP3 option if possible - support multiple audio bitrates
@@ -347,10 +339,6 @@ async def download(url: str, filename: str = "media", referer: str = None, h: st
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
 
 
 @app.post("/download_subtitles")
