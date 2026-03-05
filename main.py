@@ -69,15 +69,7 @@ async def analyze(request: AnalyzeRequest):
 
     # yt-dlp options
     cookie_file = f"cookies_{os.getpid()}.txt"
-    # Attempt 8: Manual scraping fallback and refined YouTube bypass
-    # Using specific headers that often work on data center IPs
-    common_headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'DNT': '1',
-    }
-
+    # Attempt 9: Improved error reporting and expanded rotation
     ydl_opts_base = {
         'quiet': True,
         'no_warnings': True,
@@ -88,27 +80,25 @@ async def analyze(request: AnalyzeRequest):
     }
 
     info = None
-    
-    # Tiered Extraction Strategy
     strategies = [
-        # Strategy 1: TV Embedded (Often bypasses account-level blocks)
+        # Strategy 1: TV Embedded (Highly robust)
         {
             'impersonate': 'chrome:windows-10',
-            'extractor_args': {'youtube': {'player_client': ['tv_embedded'], 'skip': ['dash', 'hls']}}
+            'extractor_args': {'youtube': {'player_client': ['tv_embedded'], 'player_skip': ['web', 'ios', 'android'], 'skip': ['dash', 'hls']}}
         },
-        # Strategy 2: Web Embedded (Good for server extraction)
+        # Strategy 2: Android Embedded (Mobile path)
+        {
+            'impersonate': 'android:chrome-120',
+            'extractor_args': {'youtube': {'player_client': ['android_embedded'], 'skip': ['dash', 'hls']}}
+        },
+        # Strategy 3: Web Embedded (Often works for basic extraction)
         {
             'impersonate': 'chrome:windows-10',
             'extractor_args': {'youtube': {'player_client': ['web_embedded'], 'skip': ['dash', 'hls']}}
-        },
-        # Strategy 3: Android / iOS (Mobile bypass)
-        {
-            'impersonate': 'android:chrome-120',
-            'extractor_args': {'youtube': {'player_client': ['android'], 'player_skip': ['web'], 'skip': ['dash', 'hls']}}
         }
     ]
 
-    last_error = ""
+    last_error = "No strategies succeeded"
     for strategy in strategies:
         try:
             opts = ydl_opts_base.copy()
@@ -117,23 +107,27 @@ async def analyze(request: AnalyzeRequest):
                 info = ydl.extract_info(url, download=False)
                 if info: break
         except Exception as e:
-            last_error = str(e)
-            print(f"Strategy failed for {url}: {last_error}")
+            last_error = str(e).strip()
+            print(f"Strategy failed: {last_error}")
             continue
     
-    # Special Fallback for TikTok/Instagram if yt-dlp is blocked
-    if not info and ("tiktok.com" in url or "instagram.com" in url):
-        print("yt-dlp IP-Blocked. Attempting manual scrape...")
-        # Note: In a production environment, we might use a dedicated API here
-        # For this task, we'll try one last yt-dlp strategy with a very clean impersonator
+    if not info:
+        # Final desperate attempt: No impersonation
         try:
-            with yt_dlp.YoutubeDL({**ydl_opts_base, 'impersonate': 'chrome:linux-114'}) as ydl_clean:
-                info = ydl_clean.extract_info(url, download=False)
-        except:
-            pass
+            with yt_dlp.YoutubeDL({'quiet': True, 'nocheckcertificate': True}) as ydl_final:
+                info = ydl_final.extract_info(url, download=False)
+        except Exception as fe:
+            last_error = str(fe).strip() or last_error
 
     if not info:
-        raise HTTPException(status_code=400, detail=f"Blocked by platform. (Render IP flagged). Please try a different URL or try again later. Error: {last_error}")
+        # Check for common block patterns
+        if "bot" in last_error.lower() or "sign in" in last_error.lower():
+            detail = f"YouTube bot detection is blocking this server (Render IP). {last_error}"
+        elif "blocked" in last_error.lower() or "rate-limit" in last_error.lower():
+            detail = f"The platform is blocking this server (IP Blocked). {last_error}"
+        else:
+            detail = f"Failed to analyze link: {last_error}"
+        raise HTTPException(status_code=400, detail=detail)
 
     try:
         platform = get_platform(url)
@@ -142,7 +136,7 @@ async def analyze(request: AnalyzeRequest):
         
         # Combined (Video + Audio)
         combined = [f for f in raw_formats if f.get('vcodec') != 'none' and f.get('acodec') != 'none']
-        # Video Only (High-res)
+        # Video Only
         video_only = [f for f in raw_formats if f.get('vcodec') != 'none' and (not f.get('acodec') or f.get('acodec') == 'none')]
         
         combined.sort(key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True)
