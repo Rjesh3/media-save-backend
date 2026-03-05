@@ -69,90 +69,119 @@ async def analyze(request: AnalyzeRequest):
 
     # yt-dlp options
     cookie_file = f"cookies_{os.getpid()}.txt"
+    # Enhanced YouTube bot detection bypass with multi-client strategy
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
-        # Strictly prefer combined formats for direct streaming
-        'format': 'best[ext=mp4]/best',
-        'skip_download': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'cookiefile': cookie_file,
-        'writesubtitles': True,
-        'allsubtitles': True,
         'nocheckcertificate': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+        'cookiefile': cookie_file,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Sec-Fetch-Mode': 'navigate',
+        },
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'ios', 'web'],
+                'player_client': ['android', 'ios', 'tv_embedded', 'web'],
                 'player_skip': ['web_embedded_client'],
-                'skip': ['dash', 'hls'] # For extraction, we mostly want direct links for proxying
+                'skip': ['dash', 'hls']
+            },
+            'instagram': {
+                'check_all_subs': True
             }
         }
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # YouTube bot detection bypass: try fetching with multiple retries if needed
-            info = ydl.extract_info(url, download=False)
+            try:
+                info = ydl.extract_info(url, download=False)
+            except Exception as e:
+                # If hit by bot detection, try a more aggressive fallback if it's YouTube
+                if "Sign in to confirm you’re not a bot" in str(e) and "youtube" in url:
+                    print("Bot detection hit. Retrying with mobile-only clients...")
+                    ydl_opts['extractor_args']['youtube']['player_client'] = ['ios', 'android']
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
+                        info = ydl2.extract_info(url, download=False)
+                elif "empty media response" in str(e) and "instagram" in url:
+                    # Try once more without specific extractor args for Instagram
+                    print("Instagram empty response. Retrying with basic options...")
+                    with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl3:
+                        info = ydl3.extract_info(url, download=False)
+                else:
+                    raise e
             
             platform = get_platform(url)
             formats = []
-            
-            # Extract relevant formats
             raw_formats = info.get('formats', [])
             
-            # Sort by height descending, prioritizing those that HAVE both video and audio
-            raw_formats.sort(key=lambda x: (
-                (x.get('vcodec') != 'none' and x.get('acodec') != 'none'), 
-                x.get('height') or 0, 
-                x.get('tbr') or 0
-            ), reverse=True)
+            # 1. Identify Combined (Video + Audio)
+            combined = [f for f in raw_formats if f.get('vcodec') != 'none' and f.get('acodec') != 'none']
+            # 2. Identify Video Only (High-res fallbacks)
+            video_only = [f for f in raw_formats if f.get('vcodec') != 'none' and f.get('acodec') == 'none']
+            
+            # Sort combined by height
+            combined.sort(key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True)
+            # Sort video_only by height
+            video_only.sort(key=lambda x: (x.get('height') or 0, x.get('tbr') or 0), reverse=True)
 
             seen_qualities = set()
             
-            for f in raw_formats:
-                vcodec = f.get('vcodec')
-                acodec = f.get('acodec')
+            # Add Combined formats first
+            for f in combined:
+                res = f.get('height')
+                quality = f"{res}p" if res else (f.get('format_note') or "Default")
                 
-                # MUST have both video and audio for direct streaming proxy
-                if vcodec and vcodec != 'none' and acodec and acodec != 'none':
-                    res = f.get('height')
-                    if res:
-                        quality = f"{res}p"
-                    else:
-                        quality = f.get('format_note') or "Default"
-                    
-                    # Special handling for TikTok no-watermark
-                    format_id = f.get('format_id', '').lower()
-                    if "tiktok" in platform.lower():
-                        if "watermark" not in format_id:
-                            quality = "HD (No Watermark)" if res and res >= 720 else "SD (No Watermark)"
+                # Special handling for TikTok no-watermark
+                format_id = f.get('format_id', '').lower()
+                if "tiktok" in platform.lower() and "watermark" not in format_id:
+                    quality = "HD (No Watermark)" if res and res >= 720 else "SD (No Watermark)"
 
-                    # Add suffix for HD/SD
-                    if res and res >= 720 and "HD" not in quality and "No Watermark" not in quality:
-                        quality += " (HD)"
-                    elif res and "SD" not in quality and "HD" not in quality and "No Watermark" not in quality:
-                        quality += " (SD)"
-
-                    ext = f.get('ext', 'mp4')
+                # Quality Suffix
+                if res and res >= 720 and "HD" not in quality and "No Watermark" not in quality:
+                    quality += " (HD)"
+                
+                if quality not in seen_qualities:
                     all_headers = info.get('http_headers', {}).copy()
                     all_headers.update(f.get('http_headers', {}))
                     
-                    if quality not in seen_qualities:
-                        download_url = f.get('url')
-                        formats.append({
-                            "quality": quality,
-                            "format": ext,
-                            "size": format_size(f.get('filesize') or f.get('filesize_approx')),
-                            "download_url": download_url,
-                            "headers": all_headers,
-                            "width": f.get('width'),
-                            "height": f.get('height'),
-                            "fps": f.get('fps'),
-                            "vcodec": vcodec,
-                            "acodec": acodec
-                        })
-                        seen_qualities.add(quality)
-                        add_to_cache(download_url, all_headers)
+                    formats.append({
+                        "quality": quality,
+                        "format": f.get('ext', 'mp4'),
+                        "size": format_size(f.get('filesize') or f.get('filesize_approx')),
+                        "download_url": f.get('url'),
+                        "headers": all_headers,
+                        "vcodec": f.get('vcodec'),
+                        "acodec": f.get('acodec'),
+                        "type": "video"
+                    })
+                    seen_qualities.add(quality)
+                    add_to_cache(f.get('url'), all_headers)
+
+            # Fallback for High Resolution (Video Only)
+            for f in video_only:
+                res = f.get('height')
+                if not res or res < 720: continue
+                
+                quality = f"{res}p (Video Only)"
+                if quality not in seen_qualities:
+                    all_headers = info.get('http_headers', {}).copy()
+                    all_headers.update(f.get('http_headers', {}))
+                    
+                    formats.append({
+                        "quality": quality,
+                        "format": f.get('ext', 'mp4'),
+                        "size": format_size(f.get('filesize') or f.get('filesize_approx')),
+                        "download_url": f.get('url'),
+                        "headers": all_headers,
+                        "vcodec": f.get('vcodec'),
+                        "acodec": "none",
+                        "type": "video_only"
+                    })
+                    seen_qualities.add(quality)
+                    add_to_cache(f.get('url'), all_headers)
 
             # Add an MP3 option if possible - support multiple audio bitrates
             audio_formats = [f for f in raw_formats if f.get('vcodec') == 'none' and f.get('acodec') != 'none']
