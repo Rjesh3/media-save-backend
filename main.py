@@ -69,7 +69,7 @@ async def analyze(request: AnalyzeRequest):
 
     # yt-dlp options
     cookie_file = f"cookies_{os.getpid()}.txt"
-    # Attempt 5: Ultra-robust extraction with specific client rotation
+    # Attempt 6: Impersonation and expanded client rotation
     ydl_opts_base = {
         'quiet': True,
         'no_warnings': True,
@@ -77,27 +77,32 @@ async def analyze(request: AnalyzeRequest):
         'cookiefile': cookie_file,
         'youtube_include_dash_manifest': False,
         'youtube_include_hls_manifest': False,
+        # Enable impersonation to bypass basic fingerprinting
+        'impersonate': 'chrome:windows-10',
     }
 
-    platforms_needing_fallback = ["youtube", "instagram", "facebook"]
     info = None
     
     # Tiered Extraction Strategy
     strategies = [
-        # Strategy 1: Mobile clients (often bypass data center blocks)
+        # Strategy 1: Mobile / iOS (Often the most resilient)
         {
-            'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1',
+            'impersonate': 'safari:ios-17.2',
             'extractor_args': {'youtube': {'player_client': ['ios', 'android'], 'player_skip': ['web'], 'skip': ['dash', 'hls']}}
         },
-        # Strategy 2: TV Embedded (Very robust for server environments)
+        # Strategy 2: TV Embedded (Great for video extraction on servers)
         {
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'extractor_args': {'youtube': {'player_client': ['tv_embedded'], 'player_skip': ['web'], 'skip': ['dash', 'hls']}}
+            'impersonate': 'chrome:windows-10',
+            'extractor_args': {'youtube': {'player_client': ['tv_embedded'], 'player_skip': ['web', 'ios', 'android'], 'skip': ['dash', 'hls']}}
         },
-        # Strategy 3: Standard Web with specific referrer
+        # Strategy 3: Web Creator / Android Music (Alternative paths)
         {
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-            'referer': 'https://www.google.com/',
+            'impersonate': 'chrome:windows-10',
+            'extractor_args': {'youtube': {'player_client': ['web_creator', 'android_music'], 'skip': ['dash', 'hls']}}
+        },
+        # Strategy 4: Standard Web with Chrome Impersonation
+        {
+            'impersonate': 'chrome:windows-10',
             'extractor_args': {'youtube': {'player_client': ['web'], 'player_skip': ['ios', 'android']}}
         }
     ]
@@ -105,17 +110,25 @@ async def analyze(request: AnalyzeRequest):
     last_error = ""
     for strategy in strategies:
         try:
-            opts = {**ydl_opts_base, **strategy}
+            # Merge base options with strategy-specific options
+            opts = ydl_opts_base.copy()
+            opts.update(strategy)
+            
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 if info: break
         except Exception as e:
             last_error = str(e)
-            print(f"Strategy failed for {url}: {last_error}")
+            print(f"Strategy for {url} failed: {last_error}")
             continue
     
     if not info:
-        raise HTTPException(status_code=400, detail=f"Failed to analyze link after multiple attempts: {last_error}")
+        # Final desperate attempt: Basic opts, no impersonation, no specific clients
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True, 'nocheckcertificate': True}) as ydl_final:
+                info = ydl_final.extract_info(url, download=False)
+        except Exception as final_e:
+            raise HTTPException(status_code=400, detail=f"Failed to analyze link: {str(final_e)}")
 
     try:
         platform = get_platform(url)
