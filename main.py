@@ -69,46 +69,46 @@ async def analyze(request: AnalyzeRequest):
 
     # yt-dlp options
     cookie_file = f"cookies_{os.getpid()}.txt"
-    # Enhanced YouTube bot detection bypass with multi-client strategy
+    # Advanced bypass strategy: target mobile clients specifically
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+        # Use a more randomized user agent to avoid footprinting
+        'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1',
         'cookiefile': cookie_file,
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Sec-Fetch-Mode': 'navigate',
-        },
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'ios', 'tv_embedded', 'web'],
-                'player_skip': ['web_embedded_client'],
+                'player_client': ['ios', 'android'],
+                'player_skip': ['web'],
                 'skip': ['dash', 'hls']
-            },
-            'instagram': {
-                'check_all_subs': True
             }
-        }
+        },
+        # Important for YouTube bypass in server environments
+        'youtube_include_dash_manifest': False,
+        'youtube_include_hls_manifest': False,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
+                # Try with mobile clients first
                 info = ydl.extract_info(url, download=False)
             except Exception as e:
-                # If hit by bot detection, try a more aggressive fallback if it's YouTube
-                if "Sign in to confirm you’re not a bot" in str(e) and "youtube" in url:
-                    print("Bot detection hit. Retrying with mobile-only clients...")
-                    ydl_opts['extractor_args']['youtube']['player_client'] = ['ios', 'android']
+                error_msg = str(e)
+                print(f"Extraction failed: {error_msg}")
+                
+                # If YouTube bot detection, try with ONLY android (sometimes more robust)
+                if "Sign in to confirm you’re not a bot" in error_msg and "youtube" in url:
+                    print("Bot detection hit. Retrying with Android-only client...")
+                    ydl_opts['extractor_args']['youtube']['player_client'] = ['android']
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
                         info = ydl2.extract_info(url, download=False)
-                elif "empty media response" in str(e) and "instagram" in url:
-                    # Try once more without specific extractor args for Instagram
-                    print("Instagram empty response. Retrying with basic options...")
-                    with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl3:
+                elif "instagram" in url or "facebook" in url:
+                    # For social media, try with a very basic chrome user agent as fallback
+                    print("Social media extraction failed. Retrying with desktop headers...")
+                    ydl_opts['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl3:
                         info = ydl3.extract_info(url, download=False)
                 else:
                     raise e
@@ -117,9 +117,9 @@ async def analyze(request: AnalyzeRequest):
             formats = []
             raw_formats = info.get('formats', [])
             
-            # 1. Identify Combined (Video + Audio)
+            # Identify Combined (Video + Audio)
             combined = [f for f in raw_formats if f.get('vcodec') != 'none' and f.get('acodec') != 'none']
-            # 2. Identify Video Only (High-res fallbacks)
+            # Identify Video Only (High-res fallbacks for YouTube/etc)
             video_only = [f for f in raw_formats if f.get('vcodec') != 'none' and f.get('acodec') == 'none']
             
             # Sort combined by height
@@ -129,17 +129,13 @@ async def analyze(request: AnalyzeRequest):
 
             seen_qualities = set()
             
-            # Add Combined formats first
             for f in combined:
                 res = f.get('height')
                 quality = f"{res}p" if res else (f.get('format_note') or "Default")
                 
-                # Special handling for TikTok no-watermark
-                format_id = f.get('format_id', '').lower()
-                if "tiktok" in platform.lower() and "watermark" not in format_id:
+                if "tiktok" in platform.lower() and "watermark" not in f.get('format_id', '').lower():
                     quality = "HD (No Watermark)" if res and res >= 720 else "SD (No Watermark)"
 
-                # Quality Suffix
                 if res and res >= 720 and "HD" not in quality and "No Watermark" not in quality:
                     quality += " (HD)"
                 
@@ -160,12 +156,13 @@ async def analyze(request: AnalyzeRequest):
                     seen_qualities.add(quality)
                     add_to_cache(f.get('url'), all_headers)
 
-            # Fallback for High Resolution (Video Only)
+            # High-res Fallbacks (Video Only) - Only if 1080p or higher and NOT already seen as combined
             for f in video_only:
                 res = f.get('height')
                 if not res or res < 720: continue
                 
                 quality = f"{res}p (Video Only)"
+                # If we already have a combined 1080p, we might not need this, but usually high-res is ONLY video-only
                 if quality not in seen_qualities:
                     all_headers = info.get('http_headers', {}).copy()
                     all_headers.update(f.get('http_headers', {}))
