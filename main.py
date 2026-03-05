@@ -189,53 +189,53 @@ async def analyze(request: AnalyzeRequest):
                 seen_qualities.add(quality)
                 add_to_cache(f.get('url'), h)
 
-            # Add an MP3 option if possible - support multiple audio bitrates
-            audio_formats = [f for f in raw_formats if f.get('vcodec') == 'none' and f.get('acodec') != 'none']
-            if audio_formats:
-                # Sort by bitrate descending to get best quality first
-                audio_formats.sort(key=lambda x: x.get('abr') or 0, reverse=True)
-                for audio_fmt in audio_formats[:2]:  # Offer top 2 audio qualities
-                    abr = audio_fmt.get('abr')
-                    quality_label = f"Audio - {int(abr)}kbps" if abr else "Audio - Best"
-                    if quality_label not in seen_qualities:
-                        formats.append({
-                            "quality": quality_label,
-                            "format": "mp3",
-                            "size": format_size(audio_fmt.get('filesize') or audio_fmt.get('filesize_approx')),
-                            "download_url": audio_fmt.get('url'),
-                            "bitrate": abr
-                        })
-                        seen_qualities.add(quality_label)
+        # Add an MP3 option if possible - support multiple audio bitrates
+        audio_formats = [f for f in raw_formats if f.get('vcodec') == 'none' and f.get('acodec') != 'none']
+        if audio_formats:
+            # Sort by bitrate descending to get best quality first
+            audio_formats.sort(key=lambda x: x.get('abr') or 0, reverse=True)
+            for audio_fmt in audio_formats[:2]:  # Offer top 2 audio qualities
+                abr = audio_fmt.get('abr')
+                quality_label = f"Audio - {int(abr)}kbps" if abr else "Audio - Best"
+                if quality_label not in seen_qualities:
+                    formats.append({
+                        "quality": quality_label,
+                        "format": "mp3",
+                        "size": format_size(audio_fmt.get('filesize') or audio_fmt.get('filesize_approx')),
+                        "download_url": audio_fmt.get('url'),
+                        "bitrate": abr
+                    })
+                    seen_qualities.add(quality_label)
 
-            # Check for available subtitles
-            subtitles = info.get('subtitles', {})
-            subtitle_langs = list(subtitles.keys()) if subtitles else []
-            
-            # Get duration in readable format
-            duration = info.get('duration')
-            duration_str = ""
-            if duration:
-                minutes, seconds = divmod(int(duration), 60)
-                hours, minutes = divmod(minutes, 60)
-                if hours > 0:
-                    duration_str = f"{hours}h {minutes}m {seconds}s"
-                else:
-                    duration_str = f"{minutes}m {seconds}s"
+        # Check for available subtitles
+        subtitles = info.get('subtitles', {})
+        subtitle_langs = list(subtitles.keys()) if subtitles else []
+        
+        # Get duration in readable format
+        duration = info.get('duration')
+        duration_str = ""
+        if duration:
+            minutes, seconds = divmod(int(duration), 60)
+            hours, minutes = divmod(minutes, 60)
+            if hours > 0:
+                duration_str = f"{hours}h {minutes}m {seconds}s"
+            else:
+                duration_str = f"{minutes}m {seconds}s"
 
-            return {
-                "platform": platform,
-                "title": info.get('title', 'Media Content'),
-                "thumbnail": info.get('thumbnail'),
-                "duration": duration,
-                "duration_str": duration_str,
-                "uploader": info.get('uploader', ''),
-                "view_count": info.get('view_count'),
-                "like_count": info.get('like_count'),
-                "formats": formats,
-                "subtitles": subtitle_langs,
-                "original_url": url,
-                "cookie_file": cookie_file
-            }
+        return {
+            "platform": platform,
+            "title": info.get('title', 'Media Content'),
+            "thumbnail": info.get('thumbnail'),
+            "duration": duration,
+            "duration_str": duration_str,
+            "uploader": info.get('uploader', ''),
+            "view_count": info.get('view_count'),
+            "like_count": info.get('like_count'),
+            "formats": formats,
+            "subtitles": subtitle_langs,
+            "original_url": url,
+            "cookie_file": cookie_file
+        }
 
     except Exception as e:
         print(f"Error extracting {url}: {str(e)}")
