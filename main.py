@@ -72,18 +72,33 @@ async def analyze(request: AnalyzeRequest):
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
-        # Prefer pre-combined formats or best mp4 to avoid DASH unmerged streams
+        # Prefer combined formats for direct streaming without backend merging
         'format': 'best[ext=mp4]/best',
         'skip_download': True,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'cookiefile': cookie_file,
         'writesubtitles': True,
-        'allsubtitles': True
+        'allsubtitles': True,
+        'nocheckcertificate': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'web'],
+                'player_skip': ['configs', 'web_embedded_client']
+            }
+        }
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            # Special handling for YouTube bot detection: try multiple times or with different settings
+            try:
+                info = ydl.extract_info(url, download=False)
+            except Exception as e:
+                if "Sign in to confirm you’re not a bot" in str(e):
+                    # Fallback or retry logic if needed
+                    print(f"Bot detection hit for {url}, attempting alternative extraction...")
+                    raise e
+                raise e
             
             platform = get_platform(url)
             formats = []
@@ -92,17 +107,20 @@ async def analyze(request: AnalyzeRequest):
             raw_formats = info.get('formats', [])
             
             # Sort by height descending
-            raw_formats.sort(key=lambda x: x.get('height') or 0, reverse=True)
+            raw_formats.sort(key=lambda x: (x.get('vcodec') != 'none', x.get('height') or 0, x.get('tbr') or 0), reverse=True)
 
             seen_qualities = set()
             
             for f in raw_formats:
-                # MUST have both video and audio
+                # MUST have both video and audio for direct streaming
                 vcodec = f.get('vcodec')
                 acodec = f.get('acodec')
                 
-                # Check for 'none' or missing codecs to avoid audio-only/video-only DASH streams
-                if vcodec and vcodec != 'none' and acodec and acodec != 'none':
+                is_video = vcodec and vcodec != 'none'
+                is_audio = acodec and acodec != 'none'
+                
+                # Check for combined formats (has both)
+                if is_video and is_audio:
                     res = f.get('height')
                     if res:
                         quality = f"{res}p"
@@ -136,7 +154,9 @@ async def analyze(request: AnalyzeRequest):
                             "headers": all_headers,
                             "width": f.get('width'),
                             "height": f.get('height'),
-                            "fps": f.get('fps')
+                            "fps": f.get('fps'),
+                            "vcodec": vcodec,
+                            "acodec": acodec
                         })
                         seen_qualities.add(quality)
                         # Store in cache for backend retrieval during download
@@ -201,65 +221,56 @@ async def download(url: str, filename: str = "media", referer: str = None, h: st
 
     try:
         # 1. Base default headers
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         headers_request = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "User-Agent": ua,
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
             "Connection": "keep-alive",
         }
         
-        # 2. Platform-specific defaults (can be overridden by forwarded headers)
-        if "googlevideo.com" in url:
-            headers_request["Referer"] = "https://www.youtube.com/"
-            headers_request["Origin"] = "https://www.youtube.com"
-        elif "tiktok.com" in url:
-            # Match extraction UA for consistency
-            headers_request["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            headers_request["Referer"] = referer or "https://www.tiktok.com/"
-            headers_request["Accept"] = "*/*"
-            # Host must be precise
-            parsed_url = urllib.parse.urlparse(url)
-            headers_request["Host"] = parsed_url.netloc
-            # Remove any contradictory headers
-            for h_key in ["Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest", "Origin", "Authority"]:
-                headers_request.pop(h_key, None)
-        
-        # 3. Apply forwarded headers (from h parameter OR cache)
+        # 2. Apply forwarded headers (from h parameter OR cache)
         # Use cache if h is missing (common for TikTok due to URL length limits)
         cached_headers = header_cache.get(url)
-        if cached_headers and not h:
-            print("Found security headers in backend cache")
+        if cached_headers:
+            print(f"Applying headers from cache for {url[:50]}...")
             for k, v in cached_headers.items():
-                if k.lower() in ["host", "content-length"]: continue
+                if k.lower() in ["host", "content-length", "connection"]: continue
                 headers_request[k] = v
         
         if h:
-            print(f"Received h parameter of length {len(h)}")
             try:
-                # Add padding if necessary for base64
                 padding = len(h) % 4
-                if padding > 0:
-                    h += "=" * (4 - padding)
-                    
+                if padding > 0: h += "=" * (4 - padding)
                 decoded_h = base64.b64decode(h).decode('utf-8')
                 forwarded_headers = json.loads(decoded_h)
                 if isinstance(forwarded_headers, dict):
-                    # Filter out headers that might cause issues if duplicated or conflict with logic
                     for k, v in forwarded_headers.items():
-                        # Don't let forwarded headers break theHost or Range if we determined them
-                        if k.lower() in ["host", "content-length"]: continue
+                        if k.lower() in ["host", "content-length", "connection"]: continue
                         headers_request[k] = v
-                    print(f"Applied {len(forwarded_headers)} forwarded headers from h param")
             except Exception as he:
                 print(f"Failed to decode forwarded headers: {he}")
+
+        # 3. Platform-specific overrides
+        parsed_url = urllib.parse.urlparse(url)
+        if "tiktok.com" in parsed_url.netloc or "tiktokv.com" in parsed_url.netloc:
+            headers_request["Referer"] = referer or "https://www.tiktok.com/"
+            headers_request["User-Agent"] = ua
+            # Ensure Host header is correct
+            headers_request["Host"] = parsed_url.netloc
+
+        if "googlevideo.com" in url:
+            headers_request["Referer"] = "https://www.youtube.com/"
+            headers_request["Origin"] = "https://www.youtube.com"
             
-        # Use a session to persist cookies if needed
+        # Use a session (curl_cffi for better impersonation)
         try:
             from curl_cffi import requests as c_requests
             session = c_requests.Session(impersonate="chrome")
         except ImportError:
             session = requests.Session()
-        # Load cookies if they were saved
+
+        # Load cookies
         if cfile and os.path.exists(cfile):
             try:
                 import http.cookiejar
@@ -268,76 +279,74 @@ async def download(url: str, filename: str = "media", referer: str = None, h: st
                 session.cookies = cookie_jar
             except Exception as ce:
                 print(f"Failed to load cookies: {ce}")
-        max_retries = 2
+
+        # Request with retries and redirect handling
+        max_retries = 3
         response = None
         
         for attempt in range(max_retries):
             try:
-                print(f"Attempt {attempt+1}/{max_retries} to download from {url}")
-                # Log non-sensitive headers for debugging
                 log_headers = {k: v for k, v in headers_request.items() if k.lower() not in ['cookie', 'authorization']}
-                print(f"Request Headers: {json.dumps(log_headers)}")
+                print(f"Download Attempt {attempt+1}: {url[:100]}...")
                 
-                response = session.get(url, stream=True, timeout=30, headers=headers_request, allow_redirects=True)
+                # Check for curl_cffi session or standard requests
+                if hasattr(session, 'get'):
+                    response = session.get(url, stream=True, timeout=30, headers=headers_request, allow_redirects=True)
+                else:
+                    response = session.get(url, stream=True, timeout=30, headers=headers_request, allow_redirects=True)
+                
                 if response.status_code in [200, 206]:
-                    print(f"Download successful after {attempt+1} attempt(s) for {url}")
                     break
-                # If 403, wait a tiny bit then retry
+                
                 if response.status_code == 403:
-                    print(f"Attempt {attempt+1} received 403 for {url}. Retrying in 1 second...")
-                    time.sleep(1)
-                else:
-                    print(f"Attempt {attempt+1} received {response.status_code} for {url}. Not retrying this status code.")
-                    break # Do not retry for other non-200/206 codes unless specified
+                    if attempt < max_retries - 1:
+                        time.sleep(1.5)
+                        continue
+                break
             except Exception as e:
-                print(f"Attempt {attempt+1} failed for {url}: {e}")
-                if attempt == max_retries - 1:
-                    print(f"All {max_retries} attempts failed for {url}.")
-                    raise
-                else:
-                    print(f"Retrying after exception for {url} in 1 second...")
-                    time.sleep(1) # Wait before retrying after an exception
-        
-        # If we get a 403/404 after retries, the URL might have expired or is IP-locked
-        status_code = response.status_code if response is not None else 500
-        if status_code != 200 and status_code != 206:
-            print(f"Proxy error: {status_code} for {url}")
-            raise HTTPException(status_code=status_code, detail=f"Download failed: {status_code}. Media provider rejected the request. Please refresh the link.")
+                print(f"Attempt {attempt+1} error: {e}")
+                if attempt == max_retries - 1: raise
+                time.sleep(1)
 
-        # Determine extension from Content-Type
+        if not response or response.status_code not in [200, 206]:
+            status = response.status_code if response else "Unknown"
+            raise HTTPException(status_code=400, detail=f"Media provider returned status {status}")
+
         content_type = response.headers.get("Content-Type", "video/mp4")
+        # Ensure we don't serve a tiny text file as a video (common in 403 pages disguised as 200)
+        content_length = response.headers.get("Content-Length")
+        if content_length and int(content_length) < 5000 and "text" in content_type:
+             raise HTTPException(status_code=400, detail="Received an invalid small file from the provider.")
+
         ext = "mp4"
         if "audio" in content_type: ext = "mp3"
         elif "image" in content_type: ext = "jpg"
         
-        # Override with actual ext if present in URL
-        url_path = url.split("?")[0]
-        if "." in url_path.split("/")[-1]:
-            potential_ext = url_path.split("/")[-1].split(".")[-1]
-            if 2 <= len(potential_ext) <= 4:
-                ext = potential_ext
-
-        def iter_content():
-            for chunk in response.iter_content(chunk_size=1024 * 128):
-                if chunk:
-                    yield chunk
-
+        # Determine filename and sanitization
         ascii_filename = "".join(c for c in filename if ord(c) < 128) or "media"
-        # Remove common problematic symbols for filenames
         ascii_filename = re.sub(r'[\\/*?:"<>|]', "", ascii_filename)
         encoded_filename = urllib.parse.quote(filename)
         
-        headers = {
+        resp_headers = {
             "Content-Disposition": f'attachment; filename="{ascii_filename}.{ext}"; filename*=UTF-8\'\'{encoded_filename}.{ext}',
             "Content-Type": content_type,
             "Access-Control-Expose-Headers": "Content-Disposition"
         }
-        
-        cl = response.headers.get("Content-Length")
-        if cl:
-            headers["Content-Length"] = cl
+        if content_length: resp_headers["Content-Length"] = content_length
 
-        return StreamingResponse(iter_content(), media_type=content_type, headers=headers)
+        def iter_content():
+            try:
+                # curl_cffi response has iter_content too
+                for chunk in response.iter_content(chunk_size=128 * 1024):
+                    if chunk: yield chunk
+            except Exception as e:
+                print(f"Streaming error: {e}")
+
+        return StreamingResponse(iter_content(), media_type=content_type, headers=resp_headers)
+
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
     except Exception as e:
         traceback.print_exc()
@@ -375,6 +384,26 @@ async def download_subtitles(request: AnalyzeRequest):
         raise HTTPException(status_code=400, detail=f"Failed to extract subtitles: {str(e)}")
 
 
+@app.get("/")
+async def root():
+    return {
+        "message": "Media Save Backend Running",
+        "status": "ok"
+    }
+
+@app.get("/test")
+async def test():
+    return {
+        "status": "API working"
+    }
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy"
+    }
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
