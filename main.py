@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from pytubefix import YouTube as PyTubeYouTube
 
 app = FastAPI(title="MediaSave API")
 
@@ -127,7 +128,108 @@ async def analyze(request: AnalyzeRequest):
         except Exception as e:
             print("TikWM API failed, falling back to yt-dlp:", e)
 
-    # yt-dlp options
+    # Use pytubefix for YouTube to bypass bot detection on datacenter IPs
+    if platform == "YouTube":
+        try:
+            yt = PyTubeYouTube(url)
+            title = yt.title or "YouTube Video"
+            thumbnail = yt.thumbnail_url
+            duration = yt.length
+            author = yt.author
+            views = yt.views
+            
+            # Format duration
+            duration_str = ""
+            if duration:
+                minutes, seconds = divmod(int(duration), 60)
+                hours, minutes = divmod(minutes, 60)
+                if hours > 0:
+                    duration_str = f"{hours}h {minutes}m {seconds}s"
+                else:
+                    duration_str = f"{minutes}m {seconds}s"
+            
+            formats = []
+            seen_qualities = set()
+            
+            # Progressive streams (video + audio combined)
+            progressive = yt.streams.filter(progressive=True).order_by('resolution').desc()
+            for s in progressive:
+                res = s.resolution or "Default"
+                quality = res
+                height = int(res.replace('p', '')) if res and res.endswith('p') else 0
+                if height >= 720:
+                    quality += " (HD)"
+                if quality not in seen_qualities:
+                    formats.append({
+                        "quality": quality,
+                        "format": s.subtype or "mp4",
+                        "size": format_size(s.filesize_approx) if s.filesize_approx else "Unknown",
+                        "download_url": s.url,
+                        "headers": {},
+                        "vcodec": s.video_codec or "h264",
+                        "acodec": s.audio_codec or "aac",
+                        "type": "video"
+                    })
+                    seen_qualities.add(quality)
+            
+            # Adaptive video-only streams (720p+)
+            adaptive_video = yt.streams.filter(adaptive=True, only_video=True, subtype='mp4').order_by('resolution').desc()
+            for s in adaptive_video:
+                res = s.resolution or ""
+                height = int(res.replace('p', '')) if res and res.endswith('p') else 0
+                if height < 720:
+                    continue
+                quality = f"{res} (Video Only)"
+                if quality not in seen_qualities:
+                    formats.append({
+                        "quality": quality,
+                        "format": s.subtype or "mp4",
+                        "size": format_size(s.filesize_approx) if s.filesize_approx else "Unknown",
+                        "download_url": s.url,
+                        "headers": {},
+                        "vcodec": s.video_codec or "h264",
+                        "type": "video_only"
+                    })
+                    seen_qualities.add(quality)
+            
+            # Audio streams
+            audio_streams = yt.streams.filter(only_audio=True).order_by('abr').desc()
+            for s in list(audio_streams)[:2]:
+                abr = s.abr
+                quality_label = f"Audio - {abr}" if abr else "Audio - Best"
+                if quality_label not in seen_qualities:
+                    formats.append({
+                        "quality": quality_label,
+                        "format": "mp3",
+                        "size": format_size(s.filesize_approx) if s.filesize_approx else "Unknown",
+                        "download_url": s.url,
+                        "headers": {},
+                        "bitrate": int(abr.replace('kbps', '')) if abr and 'kbps' in abr else 128
+                    })
+                    seen_qualities.add(quality_label)
+            
+            # Get captions/subtitles
+            subtitle_langs = list(yt.captions.keys()) if yt.captions else []
+            
+            return {
+                "platform": "YouTube",
+                "title": title,
+                "thumbnail": thumbnail,
+                "duration": duration,
+                "duration_str": duration_str,
+                "uploader": author,
+                "view_count": views,
+                "like_count": None,
+                "formats": formats,
+                "subtitles": subtitle_langs,
+                "original_url": url,
+                "cookie_file": ""
+            }
+        except Exception as e:
+            print(f"pytubefix failed for YouTube, falling back to yt-dlp: {e}")
+            traceback.print_exc()
+
+    # yt-dlp options (fallback for YouTube and primary for other platforms)
     cookie_file = f"cookies_{os.getpid()}.txt"
     # Attempt 9: Improved error reporting and expanded rotation
     ydl_opts_base = {
