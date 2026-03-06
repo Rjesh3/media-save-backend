@@ -592,9 +592,13 @@ async def test():
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "healthy"
-    }
+    import subprocess
+    node_v = "Not installed"
+    try:
+        node_v = subprocess.check_output(["node", "-v"]).decode().strip()
+    except:
+        pass
+    return {"status": "healthy", "node_version": node_v}
 
 if __name__ == "__main__":
     import uvicorn
