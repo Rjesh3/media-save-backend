@@ -580,7 +580,7 @@ async def download_subtitles(request: AnalyzeRequest):
 @app.get("/")
 async def root():
     return {
-        "message": "Media Save Backend Running",
+        "message": "Media Save Backend Running (v1.5-pytubefix)",
         "status": "ok"
     }
 
