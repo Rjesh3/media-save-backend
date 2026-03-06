@@ -1,11 +1,13 @@
 # Use official lightweight Python image
 FROM python:3.11-slim
 
-# Install system dependencies including ffmpeg
+# Install system dependencies including ffmpeg and nodejs (for pytubefix PO token)
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     gcc \
     python3-dev \
+    nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory inside the container
