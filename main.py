@@ -67,6 +67,66 @@ async def analyze(request: AnalyzeRequest):
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
 
+    platform = get_platform(url)
+
+    # Use TikWM for TikTok to avoid 403s on direct download URLs
+    if platform == "TikTok":
+        try:
+            resp = requests.post("https://tikwm.com/api/", data={"url": url}, timeout=15)
+            data = resp.json()
+            if data.get("code") == 0:
+                vid_data = data.get("data", {})
+                formats = []
+                
+                if vid_data.get("play"):
+                    formats.append({
+                        "quality": "HD (No Watermark)",
+                        "format": "mp4",
+                        "size": format_size(vid_data.get("size", 0)),
+                        "download_url": vid_data.get("play"),
+                        "headers": {},
+                        "vcodec": "h264",
+                        "type": "video"
+                    })
+                
+                if vid_data.get("wmplay"):
+                    formats.append({
+                        "quality": "SD (Watermarked)",
+                        "format": "mp4",
+                        "size": format_size(vid_data.get("wm_size", 0)),
+                        "download_url": vid_data.get("wmplay"),
+                        "headers": {},
+                        "vcodec": "h264",
+                        "type": "video"
+                    })
+                    
+                if vid_data.get("music"):
+                    formats.append({
+                        "quality": "Audio - Original Sound",
+                        "format": "mp3",
+                        "size": "Unknown",
+                        "download_url": vid_data.get("music"),
+                        "headers": {},
+                        "bitrate": 128
+                    })
+
+                return {
+                    "platform": "TikTok",
+                    "title": vid_data.get("title", "TikTok Video").strip() or "TikTok Video",
+                    "thumbnail": vid_data.get("origin_cover") or vid_data.get("cover"),
+                    "duration": vid_data.get("duration", 0),
+                    "duration_str": f"{vid_data.get('duration', 0)}s",
+                    "uploader": vid_data.get("author", {}).get("nickname", "Unknown"),
+                    "view_count": vid_data.get("play_count", 0),
+                    "like_count": vid_data.get("digg_count", 0),
+                    "formats": formats,
+                    "subtitles": [],
+                    "original_url": url,
+                    "cookie_file": ""
+                }
+        except Exception as e:
+            print("TikWM API failed, falling back to yt-dlp:", e)
+
     # yt-dlp options
     cookie_file = f"cookies_{os.getpid()}.txt"
     # Attempt 9: Improved error reporting and expanded rotation
@@ -280,20 +340,25 @@ async def download(url: str, filename: str = "media", referer: str = None, h: st
 
         # 3. Platform-specific overrides
         parsed_url = urllib.parse.urlparse(url)
+        is_youtube = "googlevideo.com" in url
+        
         if "tiktok.com" in parsed_url.netloc or "tiktokv.com" in parsed_url.netloc:
             headers_request["Referer"] = referer or "https://www.tiktok.com/"
-            headers_request["User-Agent"] = ua
             # Ensure Host header is correct
             headers_request["Host"] = parsed_url.netloc
 
-        if "googlevideo.com" in url:
-            headers_request["Referer"] = "https://www.youtube.com/"
-            headers_request["Origin"] = "https://www.youtube.com"
+        if is_youtube:
+            # Drop Host header so requests calculates it
+            headers_request.pop("Host", None)
             
-        # Use a session (curl_cffi for better impersonation)
+        # Use a session
         try:
             from curl_cffi import requests as c_requests
-            session = c_requests.Session(impersonate="chrome")
+            # Don't use impersonate for YouTube to avoid stomping on yt-dlp's carefully crafted User-Agent!
+            if is_youtube:
+                session = c_requests.Session()
+            else:
+                session = c_requests.Session(impersonate="chrome")
         except ImportError:
             session = requests.Session()
 
@@ -315,7 +380,8 @@ async def download(url: str, filename: str = "media", referer: str = None, h: st
             try:
                 log_headers = {k: v for k, v in headers_request.items() if k.lower() not in ['cookie', 'authorization']}
                 print(f"Download Attempt {attempt+1}: {url[:100]}...")
-                
+                print(f"    Final Headers: {log_headers}")
+
                 # Check for curl_cffi session or standard requests
                 if hasattr(session, 'get'):
                     response = session.get(url, stream=True, timeout=30, headers=headers_request, allow_redirects=True)
@@ -335,8 +401,8 @@ async def download(url: str, filename: str = "media", referer: str = None, h: st
                 if attempt == max_retries - 1: raise
                 time.sleep(1)
 
-        if not response or response.status_code not in [200, 206]:
-            status = response.status_code if response else "Unknown"
+        if response is None or response.status_code not in [200, 206]:
+            status = response.status_code if response is not None else "Unknown"
             raise HTTPException(status_code=400, detail=f"Media provider returned status {status}")
 
         content_type = response.headers.get("Content-Type", "video/mp4")
@@ -371,6 +437,8 @@ async def download(url: str, filename: str = "media", referer: str = None, h: st
 
         return StreamingResponse(iter_content(), media_type=content_type, headers=resp_headers)
 
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
